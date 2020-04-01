@@ -40,13 +40,20 @@ func (jm *JobManager) status(ev *api.Event) *api.EventResponse {
 			Err:       fmt.Errorf("could not fetch events associated to job state: %v", err),
 		}
 	}
-	currentJob, ok := jm.jobs[jobID]
-	if !ok {
-		return &api.EventResponse{
-			JobID:     jobID,
-			Requestor: ev.Msg.Requestor(),
-			Err:       fmt.Errorf("job manager is not owner of job id %d", jobID),
-		}
+	evResp := api.EventResponse{
+		JobID:     jobID,
+		Requestor: ev.Msg.Requestor(),
+		Err:       nil,
+	}
+	req, err := jm.jobEventManager.FetchRequest(jobID)
+	if err != nil {
+		evResp.Err = fmt.Errorf("failed to fetch request for job ID %d: %w", jobID, err)
+		return &evResp
+	}
+	currentJob, err := NewJobFromRequest(req)
+	if err != nil {
+		evResp.Err = fmt.Errorf("failed to build job object from job request: %w", err)
+		return &evResp
 	}
 
 	// Lookup job starting time and job termination time based on the events emitted
@@ -83,27 +90,17 @@ func (jm *JobManager) status(ev *api.Event) *api.EventResponse {
 	// Fetch the ID of the last run that was started
 	runID, err := jm.jobRunner.GetCurrentRun(jobID)
 	if err != nil {
-		return &api.EventResponse{
-			JobID:     jobID,
-			Requestor: ev.Msg.Requestor(),
-			Err:       fmt.Errorf("could not determine the current run id being executed: %v", err),
-		}
-
+		evResp.Err = fmt.Errorf("could not determine the current run id being executed: %v", err)
+		return &evResp
 	}
 	runCoordinates := job.RunCoordinates{JobID: jobID, RunID: runID}
 	runStatus, err := jm.jobRunner.BuildRunStatus(runCoordinates, currentJob)
 	if err != nil {
-		return &api.EventResponse{
-			JobID:     jobID,
-			Requestor: ev.Msg.Requestor(),
-			Err:       fmt.Errorf("could not rebuild the status of the job: %v", err),
-		}
+		evResp.Err = fmt.Errorf("could not rebuild the status of the job: %v", err)
+		return &evResp
 	}
 	jobStatus.RunStatus = *runStatus
-	return &api.EventResponse{
-		JobID:     jobID,
-		Requestor: ev.Msg.Requestor(),
-		Err:       nil,
-		Status:    &jobStatus,
-	}
+	evResp.Status = &jobStatus
+	evResp.Err = nil
+	return &evResp
 }

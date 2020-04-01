@@ -25,6 +25,7 @@ func (jm *JobManager) start(ev *api.Event) *api.EventResponse {
 	request := job.Request{
 		JobName:         j.Name,
 		Requestor:       string(ev.Msg.Requestor()),
+		ServerID:        ev.ServerID,
 		RequestTime:     time.Now(),
 		JobDescriptor:   msg.JobDescriptor,
 		TestDescriptors: j.TestDescriptors,
@@ -46,10 +47,6 @@ func (jm *JobManager) start(ev *api.Event) *api.EventResponse {
 	jm.jobsWg.Add(1)
 	go func() {
 		defer jm.jobsWg.Done()
-
-		jm.jobsMu.Lock()
-		jm.jobs[j.ID] = j
-		jm.jobsMu.Unlock()
 
 		start := time.Now()
 		runReports, finalReports, err := jm.jobRunner.Run(j)

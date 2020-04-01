@@ -46,10 +46,8 @@ type errorPayload struct {
 // * enqueuing new job requests, and handling their status
 // * starting, stopping, and retrying jobs
 type JobManager struct {
-	jobs      map[types.JobID]*job.Job
 	jobRunner *runner.JobRunner
 
-	jobsMu sync.Mutex
 	jobsWg sync.WaitGroup
 
 	jobEventManager    job.EventEmitterFetcher
@@ -61,13 +59,21 @@ type JobManager struct {
 	pluginRegistry *pluginregistry.PluginRegistry
 }
 
-// NewJob returns a new Job object and the fetched test descriptors
-func NewJob(pr *pluginregistry.PluginRegistry, jobDescriptor string) (*job.Job, error) {
-
+// NewJobFromRequest returns a new Job object from a job.Request .
+func NewJobFromRequest(req *job.Request) (*job.Job, error) {
 	var jd *job.JobDescriptor
-	if err := json.Unmarshal([]byte(jobDescriptor), &jd); err != nil {
+	if err := json.Unmarshal([]byte(req.JobDescriptor), &jd); err != nil {
 		return nil, err
 	}
+	j, err := newPartialJobFromDescriptor(jd)
+	if err != nil {
+		return nil, err
+	}
+	// TODO set j.Tests, j.RunReporterBundles and j.FinalReporterBundles
+	return j, nil
+}
+
+func newPartialJobFromDescriptor(jd *job.JobDescriptor) (*job.Job, error) {
 
 	if jd == nil {
 		return nil, errors.New("JobDescriptor cannot be nil")
@@ -89,6 +95,38 @@ func NewJob(pr *pluginregistry.PluginRegistry, jobDescriptor string) (*job.Job, 
 		if strings.TrimSpace(reporter.Name) == "" {
 			return nil, errors.New("run reporters cannot have empty or all-whitespace names")
 		}
+	}
+
+	job := job.Job{
+		ID:          types.JobID(0),
+		Name:        jd.JobName,
+		Tags:        jd.Tags,
+		Runs:        jd.Runs,
+		RunInterval: time.Duration(jd.RunInterval),
+		// Tests and bundles must be set externally
+		TestDescriptors:      "",
+		Tests:                nil,
+		RunReporterBundles:   nil,
+		FinalReporterBundles: nil,
+	}
+
+	job.Done = make(chan struct{})
+
+	job.CancelCh = make(chan struct{})
+	job.PauseCh = make(chan struct{})
+
+	return &job, nil
+}
+
+// NewJob returns a new Job object and the fetched test descriptors
+func NewJob(pr *pluginregistry.PluginRegistry, jobDescriptor string) (*job.Job, error) {
+	var jd *job.JobDescriptor
+	if err := json.Unmarshal([]byte(jobDescriptor), &jd); err != nil {
+		return nil, err
+	}
+	j, err := newPartialJobFromDescriptor(jd)
+	if err != nil {
+		return nil, err
 	}
 
 	var runReporterBundles []*job.ReporterBundle
@@ -179,26 +217,12 @@ func NewJob(pr *pluginregistry.PluginRegistry, jobDescriptor string) (*job.Job, 
 		return nil, fmt.Errorf("failed to marshal test descriptors: %w", err)
 	}
 
-	// Create a Job object from the above managers and parameters. The Job ID assigned
-	// is 0, and gets actually set by the JobManager after calling the persistence layer
-	job := job.Job{
-		ID:                   types.JobID(0),
-		Name:                 jd.JobName,
-		Tags:                 jd.Tags,
-		Runs:                 jd.Runs,
-		RunInterval:          time.Duration(jd.RunInterval),
-		TestDescriptors:      string(testDescriptorsJSON),
-		Tests:                tests,
-		RunReporterBundles:   runReporterBundles,
-		FinalReporterBundles: finalReporterBundles,
-	}
+	j.TestDescriptors = string(testDescriptorsJSON)
+	j.Tests = tests
+	j.RunReporterBundles = runReporterBundles
+	j.FinalReporterBundles = finalReporterBundles
 
-	job.Done = make(chan struct{})
-
-	job.CancelCh = make(chan struct{})
-	job.PauseCh = make(chan struct{})
-
-	return &job, nil
+	return j, nil
 }
 
 // New initializes and returns a new JobManager with the given API listener.
@@ -214,7 +238,6 @@ func New(l api.Listener, pr *pluginregistry.PluginRegistry) (*JobManager, error)
 	jm := JobManager{
 		apiListener:        l,
 		pluginRegistry:     pr,
-		jobs:               make(map[types.JobID]*job.Job),
 		jobEventManager:    jobEventManager,
 		frameworkEvManager: frameworkEvManager,
 		testEvManager:      testEvManager,
@@ -312,15 +335,15 @@ loop:
 
 // CancelJob sends a cancellation request to a specific job.
 func (jm *JobManager) CancelJob(jobID types.JobID) error {
-	jm.jobsMu.Lock()
-	job, ok := jm.jobs[jobID]
-	if !ok {
-		jm.jobsMu.Unlock()
-		return fmt.Errorf("unknown job ID: %d", jobID)
+	req, err := jm.jobEventManager.FetchRequest(jobID)
+	if err != nil {
+		return err
 	}
-	delete(jm.jobs, jobID)
-	jm.jobsMu.Unlock()
-	job.Cancel()
+	j, err := NewJobFromRequest(req)
+	if err != nil {
+		return err
+	}
+	j.Cancel()
 	return nil
 }
 
@@ -331,8 +354,25 @@ func (jm *JobManager) CancelAll() {
 	// pause, not cancel.
 	log.Info("JobManager: cancelling all jobs")
 	close(jm.apiCancel)
-	for jobID, job := range jm.jobs {
-		log.Debugf("JobManager: cancelling job with ID %v", jobID)
+	// FIXME this requires passing the real server ID from the start event
+	// object, Event.ServerID
+	serverID := "TODO need a real server ID"
+	jobIDs, err := jm.jobEventManager.FetchJobIDs(serverID)
+	if err != nil {
+		log.Warningf("Failed to fetch job IDs for server id '%s': %v", serverID, err)
+		return
+	}
+	if len(jobIDs) == 0 {
+		log.Warningf("no jobs found for server ID '%s'", serverID)
+		return
+	}
+	jobs, err := jm.jobEventManager.FetchJobs(jobIDs)
+	if err != nil {
+		log.Warningf("Failed to fetch jobs for server id '%s': %v", serverID, err)
+		return
+	}
+	for _, job := range jobs {
+		log.Debugf("JobManager: cancelling job with ID %v", job.ID)
 		job.Cancel()
 	}
 }
@@ -342,10 +382,12 @@ func (jm *JobManager) CancelAll() {
 func (jm *JobManager) Pause() {
 	log.Info("JobManager: requested pausing")
 	close(jm.apiCancel)
-	for jobID, job := range jm.jobs {
-		log.Debugf("JobManager: pausing job with ID %v", jobID)
-		job.Pause()
-	}
+	/*
+		for jobID, job := range jm.jobs {
+			log.Debugf("JobManager: pausing job with ID %v", jobID)
+			job.Pause()
+		}
+	*/
 }
 
 func (jm *JobManager) emitErrEvent(jobID types.JobID, eventName event.Name, err error) error {
